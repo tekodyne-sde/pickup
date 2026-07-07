@@ -1,0 +1,9 @@
+depthai
+opencv-python
+numpy
+customtkinter
+Pillow
+ultralytics
+open3d
+scipy
+ur_rtde

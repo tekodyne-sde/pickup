@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pip install ultralytics open3d scipy)",
+      "Bash(python -c \"import capture_gui; print\\('HAS_POSE =', capture_gui.HAS_POSE\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
