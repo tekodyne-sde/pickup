@@ -81,10 +81,15 @@ the pose, save an annotated image, and open an Open3D 3D view. Type `quit` to ex
 
 ## Robot Pick Move — UR5 (`robot_pick.py`)
 
-A **one-shot** script: it detects a parcel, computes the grasp pose, transforms it
+A **one-shot** script: it detects a parcel, computes the pick point, transforms it
 into the UR5 base frame using the hand-eye calibration, and moves the robot to a
-**standoff pose** above the pick point — then stops. There is **no place motion and
-no gripper/suction actuation**.
+**standoff pose 10 cm above the pick** via a collision-safe staged path — then stops.
+There is **no place motion and no gripper/suction actuation**.
+
+The tool orientation is **held constant** (whatever the robot currently has — no
+reorientation), and the approach is a strictly axis-aligned **down → over → down**
+path. A vacuum cup seals on a straight-down approach, so matching the surface tilt is
+unnecessary and only risks sweeping the arm into fixtures.
 
 ### Prerequisites
 - OAK-D connected via USB, and a parcel in view.
@@ -106,43 +111,60 @@ no gripper/suction actuation**.
 ```cmd
 python robot_pick.py
 ```
-The script prints the detected class, the camera-frame grasp, the computed
-**base-frame target**, and a reachability check, then waits for confirmation:
+The script closes the camera, connects to the robot (read-only at first), prints the
+pick point, the computed **staged waypoints**, and a per-waypoint reachability check,
+then waits for confirmation:
 
 ```
 Type 'yes' to move, anything else to abort:
 ```
 
 - **Dry run (recommended first):** answer anything **other than** `yes`. The robot
-  does **not** move; you can confirm the printed target sits over the parcel and is
-  within reach.
+  does **not** move. Confirm each waypoint sits where you expect and that the traverse
+  height (`W2`) clearly clears the camera and stand. *(Connecting is read-only, so a
+  dry run does need the robot reachable and `ur_rtde` installed.)*
 - **Live move:** ensure the workspace is clear and the **e-stop is within reach**,
-  then type `yes`. The UR5 executes a single blocking `moveL` to the standoff pose and
-  the script exits.
+  then type `yes`. The UR5 runs the three staged moves and reports whether it actually
+  reached the standoff, then exits.
+
+### Staged path
+All three segments hold the starting orientation and are strictly axis-aligned:
+
+1. **W1 — vertical to traverse:** move straight up/down at the current XY to `Z_TRAVERSE_M`.
+2. **W2 — traverse:** move horizontally to directly above the pick, still at `Z_TRAVERSE_M`.
+3. **W3 — descend:** move straight down to the 10 cm standoff over the pick.
+
+Each segment is a blocking `moveL` that is verified against its return value and the
+robot's protective-stop state; on a stop the script reports the failing segment and the
+achieved pose instead of assuming success.
 
 ### Configuration (top of `robot_pick.py`)
 | Constant | Default | Meaning |
 |---|---|---|
 | `ROBOT_IP` | `192.168.1.10` | UR5 controller IP. |
-| `STANDOFF_M` | `0.10` | Retract distance (m) back along the surface normal. Reduce only after aim is confirmed. |
+| `STANDOFF_M` | `0.10` | Height (m) to stop **above** the pick (vertical approach). |
+| `Z_TRAVERSE_M` | `0.50` | Safe horizontal-traverse height (base Z). **Must clear the camera/stand and stay above the standoff** — the script auto-rejects a value within 5 cm of the camera height. Confirm in a dry run. |
 | `MOVE_SPEED` / `MOVE_ACCEL` | `0.10` / `0.30` | TCP linear speed (m/s) and acceleration (m/s²). |
-| `MAX_REACH_M`, `Z_MIN_M`, `Z_MAX_M` | `0.85`, `-0.30`, `1.00` | Soft envelope; a target outside it aborts the move. |
+| `MAX_REACH_M`, `Z_MIN_M`, `Z_MAX_M` | `0.85`, `-0.30`, `1.00` | Soft envelope; any waypoint outside it aborts the move. |
 | `FRAME_WIDTH` / `FRAME_HEIGHT` | `1920` / `1080` | Must match the resolution the calibrated `K` was computed at. |
 
 ### How it works
 1. Load `T_base_cam`, `K`, `D` from `handeye_result.npz`; use `K` for deprojection
    (replacing the OAK factory-default intrinsics).
-2. Detect (YOLO-OBB) → mask (SAM ∩ OBB) → grasp pose in the camera frame.
-3. Build the tool target: approach axis (tool **+Z**) = **−normal** (into the surface),
-   origin retracted `STANDOFF_M` along **+normal**.
-4. `T_base_target = T_base_cam @ T_cam_target`, converted to a `moveL` pose
-   `[x, y, z, rx, ry, rz]` (meters, axis-angle radians).
-5. Reachability guard → confirmation prompt → single `moveL` → exit.
+2. Detect (YOLO-OBB) → mask (SAM ∩ OBB) → grasp **position** in the camera frame
+   (the surface normal is computed but **not** used for orientation).
+3. Transform the pick point to the base frame: `pick_base = T_base_cam @ [position, 1]`;
+   `standoff = pick_base + [0, 0, STANDOFF_M]`.
+4. Read the current TCP orientation and hold it; build the down→over→down waypoints.
+5. Per-waypoint reachability guard + camera-clearance guard → confirmation prompt →
+   verified staged `moveL` sequence → report reached/not → exit.
 
 ### Notes & caveats
-- **Verify tool orientation at the standoff first.** The approach convention assumes
-  tool **+Z** is the approach axis; if your UR tool frame differs, the wrist will
-  orient incorrectly.
+- **Tune `Z_TRAVERSE_M` for your cell.** The default 0.50 m clears the camera
+  (~0.695 m above the base) with ~0.20 m margin, but verify the **horizontal** traverse
+  at that height doesn't clip the stand — check the printed `W2` in a dry run.
+- **Orientation is held, not corrected.** Ensure the robot's current pose already points
+  the cup usefully at the workspace before running; the script won't reorient it.
 - **Distortion `D` is not applied** (ideal-pinhole deprojection). Accurate near the
   frame center; expect cm-level error toward the edges.
 - The hand-eye calibration must correspond to the same base frame the robot reports.
