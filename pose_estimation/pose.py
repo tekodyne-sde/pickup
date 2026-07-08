@@ -41,6 +41,12 @@ DEPTH_SCALE = 1000.0
 SUCTION_PATCH_RADIUS = 0.02
 
 CLASS_NAMES = {0: "box", 1: "brown_bag", 2: "white_bag"}
+
+# Patches whose mean plane residual is within this count as "flat"; among flat
+# patches the most CENTRAL one wins (stops boxes being picked at an edge).
+FLAT_TOL_M = 0.005
+# box: flat everywhere -> pure center pick
+CLASS_FLAT_TOL = {"box": np.inf, "brown_bag": FLAT_TOL_M, "white_bag": FLAT_TOL_M}
 INFER_EVERY_N_FRAMES = 3  # run YOLO every Nth frame for smoother live preview
 
 
@@ -119,7 +125,7 @@ class GraspPoseEstimator:
         return pcd
 
     def find_flattest_patch(self, pcd, patch_radius=0.02, stride=0.01,
-                             min_points=15, plane_thresh=0.003):
+                             min_points=15, plane_thresh=0.003, flat_tol=FLAT_TOL_M):
         points = np.asarray(pcd.points)
         if len(points) < min_points:
             return None
@@ -154,24 +160,37 @@ class GraspPoseEstimator:
                     continue
 
                 a, b, c, d = plane_model
+                normal_norm = np.linalg.norm([a, b, c])
                 inlier_pts = window_points[inliers]
-                residuals = np.abs((inlier_pts @ np.array([a, b, c])) + d) / np.linalg.norm([a, b, c])
+                residuals = np.abs((inlier_pts @ np.array([a, b, c])) + d) / normal_norm
                 flatness_score = residuals.mean()
+                # tolerance test uses ALL patch points (inlier-only residuals are
+                # capped by plane_thresh, so they'd call any bump "flat")
+                resid_all = np.abs((window_points @ np.array([a, b, c])) + d) / normal_norm
+                resid_p95 = float(np.percentile(resid_all, 95))
                 center_dist = np.linalg.norm(np.array([cx, cy]) - centroid_xy)
                 combined_score = flatness_score + 0.1 * center_dist
 
                 candidates.append({
                     'plane_model': (a, b, c, d),
                     'flatness': flatness_score,
+                    'resid_p95': resid_p95,
                     'inlier_count': len(inliers),
                     'window_points': window_points[inliers],
-                    'combined_score': combined_score
+                    'combined_score': combined_score,
+                    'center_dist': center_dist
                 })
 
         if not candidates:
             return None
 
-        best = min(candidates, key=lambda c: c['combined_score'])
+        # Among patches flat enough (95% of points within flat_tol of the plane)
+        # the most central wins; if none qualify fall back to the old score.
+        flat = [c for c in candidates if c['resid_p95'] <= flat_tol]
+        if flat:
+            best = min(flat, key=lambda c: c['center_dist'])
+        else:
+            best = min(candidates, key=lambda c: c['combined_score'])
         a, b, c, d = best['plane_model']
         normal = np.array([a, b, c])
         normal = normal / np.linalg.norm(normal)
@@ -184,6 +203,7 @@ class GraspPoseEstimator:
             'position': grasp_center_3d,
             'normal': normal,
             'flatness_score': best['flatness'],
+            'resid_p95': best['resid_p95'],
             'inlier_count': best['inlier_count'],
             'patch_points': best['window_points']
         }
@@ -226,14 +246,16 @@ class GraspPoseEstimator:
 
         return {'position': position, 'quaternion': quat, 'rotation_matrix': rot_matrix}
 
-    def estimate(self, depth_map, mask, obb_corners_2d, patch_radius=0.02, full_object_pcd=None):
+    def estimate(self, depth_map, mask, obb_corners_2d, patch_radius=0.02, full_object_pcd=None,
+                 cls_name=None):
         pcd = self.deproject_mask_to_pointcloud(depth_map, mask)
         if len(pcd.points) < 20:
             print("  [FAIL] too few valid depth points in mask")
             return None, pcd
 
         pcd = self.denoise(pcd)
-        patch_result = self.find_flattest_patch(pcd, patch_radius=patch_radius)
+        flat_tol = CLASS_FLAT_TOL.get(cls_name, FLAT_TOL_M)
+        patch_result = self.find_flattest_patch(pcd, patch_radius=patch_radius, flat_tol=flat_tol)
         if patch_result is None:
             print("  [FAIL] no flat patch found meeting minimum point criteria")
             return None, pcd
@@ -486,7 +508,8 @@ def main():
                           f"(OBB polygon would be {int(mask_from_obb(last_corners, rgb_frame.shape).sum())} px)")
 
                 pose, full_pcd = estimator.estimate(
-                    depth_frame, mask, last_corners, patch_radius=SUCTION_PATCH_RADIUS
+                    depth_frame, mask, last_corners, patch_radius=SUCTION_PATCH_RADIUS,
+                    cls_name=last_class_name
                 )
 
                 if pose is None:

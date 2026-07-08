@@ -1,32 +1,38 @@
 """
-robot_pick.py — one-shot pick move for the UR5.
+robot_pick.py — one-shot parcel pick-point estimation (ML side only; NO robot).
 
 Flow (single pass, then stop):
   1. Load hand-eye calibration (handeye_result.npz): T_base_cam, K, D.
-  2. Capture one OAK-D RGB + depth frame at 1920x1080 (matches the calibrated K),
-     then CLOSE the camera before touching the robot.
+  2. Capture one OAK-D RGB + depth frame at 1920x1080 (matches the calibrated K).
   3. Detect the parcel (YOLO-OBB) -> SAM mask -> grasp pose in the CAMERA frame
-     (reuses the estimator in pose.py); take only its position.
-  4. Transform the pick POINT into the robot base frame via T_base_cam.
-  5. Move to it with a collision-safe staged path at FIXED orientation:
-        down (in place) -> over (above the pick) -> down (to a vertical standoff).
-     The tool orientation is held at whatever the robot currently has — no
-     reorientation (a vacuum cup seals on a straight-down approach). Each segment
-     is verified (moveL result + protective-stop state); the robot stops at the
-     standoff and reports whether it actually reached the target.
+     (reuses the estimator in pose.py).
+  4. Transform the pick POINT into the robot base frame via T_base_cam, print it,
+     and save the debug artifacts (.png red-dot image, .ply cloud, .npz coords).
 
-This moves a real robot. No place motion and no gripper/suction actuation are
-performed. The TCP is assumed to be configured on the pendant at the suction tip.
+Run as a script for a local end-to-end test of the pipeline. The same pipeline
+is exposed to the robot side as an HTTP API by pose_service.py (see
+POSE_SERVICE_API.md) — the robot side consumes the pick point and does all
+motion itself.
 """
+
+import os
+import time
+
+# If the OAK-D firmware crashes (X_LINK_ERROR), depthai's crash-dump collector
+# segfaults the whole process inside device.close(). Disable it so a device drop
+# raises a normal, retryable exception instead.
+os.environ.setdefault("DEPTHAI_DISABLE_CRASHDUMP_COLLECTION", "1")
 
 import numpy as np
 import depthai as dai
+import open3d as o3d
 from ultralytics import YOLO, SAM
 
 from pose import (
     GraspPoseEstimator,
     mask_from_sam,
     mask_from_obb,
+    save_annotated_snapshot,
     CLASS_NAMES,
     DEPTH_SCALE,
     SUCTION_PATCH_RADIUS,
@@ -36,7 +42,6 @@ from pose import (
 # ============================================================
 # CONFIG
 # ============================================================
-ROBOT_IP = "192.168.1.10"
 HANDEYE_NPZ = "handeye_result.npz"
 MODEL_PATH = "best.pt"
 SAM_MODEL_PATH = "sam2.1_t.pt"
@@ -45,19 +50,12 @@ SAM_MODEL_PATH = "sam2.1_t.pt"
 FRAME_WIDTH = 1920
 FRAME_HEIGHT = 1080
 
-STANDOFF_M = 0.10          # stop this far ABOVE the pick (base +Z), vertical approach
-MOVE_SPEED = 0.10          # m/s   (conservative)
-MOVE_ACCEL = 0.30          # m/s^2 (conservative)
+# Stream this long before capturing so autofocus/auto-exposure converge
+# (15 frames wasn't enough — captures came out blurry). Raise if still soft.
+CAMERA_SETTLE_S = 3.0
 
-# Safe horizontal-traverse height (base-frame Z). MUST clear the camera/stand
-# (camera sits ~0.695 m above the base) AND stay above the standoff. Tune this and
-# confirm it in a dry run before trusting it.
-Z_TRAVERSE_M = 0.50
-
-# Soft reachability envelope (UR5 max reach ~0.85 m). Purely a sanity guard so we
-# never command a wildly wrong target; not a substitute for the robot's own limits.
-MAX_REACH_M = 0.85
-Z_MIN_M, Z_MAX_M = -0.30, 1.00
+# All robot-side concerns (standoff, speed, clearances, path planning) belong
+# to the robot team — we only produce the pick point.
 
 
 # ============================================================
@@ -100,10 +98,11 @@ def create_pipeline(device: dai.Device):
     return pipeline, rgb_out, depth_out
 
 
-def capture_and_detect(rgb_queue, depth_queue, model, warmup=15):
-    """Grab a few frames so auto-exposure settles, then detect the best parcel."""
+def capture_and_detect(rgb_queue, depth_queue, model, settle_s=CAMERA_SETTLE_S):
+    """Stream frames for settle_s so autofocus/AE converge, then detect on the last."""
     rgb_frame = depth_frame = None
-    for _ in range(warmup):
+    t_end = time.time() + settle_s
+    while rgb_frame is None or time.time() < t_end:
         rgb_frame = rgb_queue.get().getCvFrame()
         depth_frame = depth_queue.get().getFrame()  # uint16 mm
 
@@ -119,7 +118,7 @@ def capture_and_detect(rgb_queue, depth_queue, model, warmup=15):
     return rgb_frame, depth_frame, corners, cls_name, conf
 
 
-def run_vision(model, sam_model, estimator):
+def run_vision(model, sam_model, estimator, debug_prefix):
     """Capture one frame, close the camera, and return the pick point (camera frame)."""
     device = dai.Device()
     try:
@@ -145,17 +144,27 @@ def run_vision(model, sam_model, estimator):
         print("  [warn] SAM returned an empty mask — falling back to OBB polygon")
         mask = mask_from_obb(corners, rgb_frame.shape)
 
-    pose, _ = estimator.estimate(
-        depth_frame, mask, corners, patch_radius=SUCTION_PATCH_RADIUS
+    pose, pcd = estimator.estimate(
+        depth_frame, mask, corners, patch_radius=SUCTION_PATCH_RADIUS, cls_name=cls_name
     )
     if pose is None:
         print("No valid grasp pose found — aborting. Robot NOT moved.")
         return None
+    pose["class_name"] = cls_name
+    pose["confidence"] = conf
 
     print("\nGrasp pose (camera frame):")
     print(f"  position (m): {np.round(pose['position'], 4)}")
     print(f"  normal:       {np.round(pose['normal'], 4)}  (orientation NOT used)")
     print(f"  flatness:     {pose['flatness_score']:.5f}  inliers: {pose['inlier_count']}")
+
+    # Debug artifacts: annotated PNG (red dot = pick pixel) + camera-frame point
+    # cloud of the parcel, so the commanded coordinates can be verified offline.
+    save_annotated_snapshot(rgb_frame, corners, cls_name, pose,
+                            estimator.fx, estimator.fy, estimator.cx, estimator.cy,
+                            f"{debug_prefix}.png", mask=mask)
+    o3d.io.write_point_cloud(f"{debug_prefix}.ply", pcd)
+    print(f"  Saved point cloud        -> {debug_prefix}.ply")
     return pose
 
 
@@ -167,63 +176,6 @@ def pick_point_base(T_base_cam, position_cam):
     p = np.ones(4, dtype=np.float64)
     p[:3] = np.asarray(position_cam, dtype=np.float64)
     return (T_base_cam @ p)[:3]
-
-
-def within_envelope(xyz):
-    x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
-    radius = float(np.hypot(x, y))
-    ok = (radius <= MAX_REACH_M) and (Z_MIN_M <= z <= Z_MAX_M)
-    return ok, radius
-
-
-# ============================================================
-# Robot motion
-# ============================================================
-def _is_protective_stopped(rtde_r):
-    fn = getattr(rtde_r, "isProtectiveStopped", None)
-    try:
-        return bool(fn()) if fn is not None else False
-    except Exception:
-        return False
-
-
-def move_segment(rtde_c, rtde_r, label, wp):
-    """Blocking moveL for one waypoint; verify it completed and wasn't stopped."""
-    print(f"  [{label}] moveL -> xyz=[{wp[0]:.4f}, {wp[1]:.4f}, {wp[2]:.4f}]")
-    try:
-        ok = rtde_c.moveL(list(wp), MOVE_SPEED, MOVE_ACCEL)
-    except Exception as exc:  # controller-side stop / disconnect
-        print(f"  [{label}] moveL raised: {exc}")
-        return False, None
-
-    stopped = _is_protective_stopped(rtde_r)
-    achieved = rtde_r.getActualTCPPose()
-    if (ok is False) or stopped:
-        print(f"  [{label}] FAILED (moveL returned {ok}, protective_stop={stopped})")
-        print(f"           achieved TCP: {np.round(achieved, 4)}")
-        return False, achieved
-    print(f"  [{label}] done. TCP: {np.round(achieved, 4)}")
-    return True, achieved
-
-
-def build_waypoints(cur_pose, standoff_base):
-    """
-    Staged path at FIXED orientation (held from cur_pose). Every segment is strictly
-    axis-aligned (pure vertical or pure horizontal) so the arm never sweeps a diagonal:
-      W1 move VERTICALLY at the current XY to the traverse height (up or down),
-      W2 traverse horizontally to above the pick at the traverse height,
-      W3 descend vertically to the standoff.
-    """
-    ori = [float(cur_pose[3]), float(cur_pose[4]), float(cur_pose[5])]
-    cx, cy = float(cur_pose[0]), float(cur_pose[1])
-    sx, sy, sz = float(standoff_base[0]), float(standoff_base[1]), float(standoff_base[2])
-
-    waypoints = [
-        ("W1 vertical-to-traverse", [cx, cy, Z_TRAVERSE_M, *ori]),
-        ("W2 traverse-above-pick", [sx, sy, Z_TRAVERSE_M, *ori]),
-        ("W3 descend-to-standoff", [sx, sy, sz, *ori]),
-    ]
-    return waypoints, ori
 
 
 # ============================================================
@@ -242,97 +194,30 @@ def main():
     sam_model = SAM(SAM_MODEL_PATH)
     estimator = GraspPoseEstimator(fx=fx, fy=fy, cx=cx, cy=cy, depth_scale=DEPTH_SCALE)
 
-    pose = run_vision(model, sam_model, estimator)
+    debug_prefix = time.strftime("debug_pick_%Y%m%d_%H%M%S")
+
+    # ponytail: one retry — the OAK-D watchdog reboots the device after a
+    # firmware crash, so a second open usually succeeds.
+    try:
+        pose = run_vision(model, sam_model, estimator, debug_prefix)
+    except RuntimeError as exc:
+        print(f"Camera error: {exc}\nRetrying once in 5 s...")
+        time.sleep(5)
+        pose = run_vision(model, sam_model, estimator, debug_prefix)
     if pose is None:
         return
 
     pick_base = pick_point_base(T_base_cam, pose["position"])
-    standoff_base = np.array([pick_base[0], pick_base[1], pick_base[2] + STANDOFF_M])
+    # Everything needed to re-check the math offline: camera-frame grasp point,
+    # the transform, and the base-frame point the robot will be commanded to.
+    np.savez(f"{debug_prefix}.npz",
+             position_cam=pose["position"], normal_cam=pose["normal"],
+             T_base_cam=T_base_cam, pick_base=pick_base)
+    print(f"Saved coordinate dump -> {debug_prefix}.npz")
+    normal_base = T_base_cam[:3, :3] @ pose["normal"]
     print(f"\nPick point (base frame):    {np.round(pick_base, 4)}")
-    print(f"Standoff ({STANDOFF_M * 100:.0f} cm above): {np.round(standoff_base, 4)}")
-
-    if standoff_base[2] > Z_TRAVERSE_M:
-        print(f"Standoff z={standoff_base[2]:.3f} m is ABOVE the traverse height "
-              f"Z_TRAVERSE_M={Z_TRAVERSE_M:.3f} m — misconfigured. Robot NOT moved.")
-        return
-
-    # The camera's base-frame height is the translation in T_base_cam. The traverse
-    # height must stay clearly below it so a vertical/horizontal move can't reach it.
-    cam_height = float(T_base_cam[2, 3])
-    if Z_TRAVERSE_M > cam_height - 0.05:
-        print(f"Z_TRAVERSE_M={Z_TRAVERSE_M:.3f} m is too close to the camera height "
-              f"{cam_height:.3f} m — lower it. Robot NOT moved.")
-        return
-
-    # Connect to read robot state and build the path. No motion happens until moveL.
-    from rtde_control import RTDEControlInterface
-    from rtde_receive import RTDEReceiveInterface
-
-    print(f"\nConnecting to UR5 at {ROBOT_IP} (read-only until you confirm)...")
-    rtde_c = RTDEControlInterface(ROBOT_IP)
-    rtde_r = RTDEReceiveInterface(ROBOT_IP)
-    try:
-        cur_pose = rtde_r.getActualTCPPose()
-        print(f"Current TCP pose: {np.round(cur_pose, 4)}")
-        if _is_protective_stopped(rtde_r):
-            print("Robot is already in a PROTECTIVE STOP — clear it on the pendant first. "
-                  "Robot NOT moved.")
-            return
-
-        waypoints, ori = build_waypoints(cur_pose, standoff_base)
-
-        print("\nPlanned staged path (orientation held constant — no reorientation):")
-        print(f"  held rotvec (rad): {np.round(ori, 4)}")
-        print(f"  speed={MOVE_SPEED} m/s, accel={MOVE_ACCEL} m/s^2, traverse z={Z_TRAVERSE_M} m")
-        plan_ok = True
-        for label, wp in waypoints:
-            ok_wp, radius = within_envelope(wp)
-            plan_ok = plan_ok and ok_wp
-            flag = "OK" if ok_wp else "OUT OF ENVELOPE"
-            print(f"  {label}: xyz=[{wp[0]:.4f}, {wp[1]:.4f}, {wp[2]:.4f}]  r={radius:.3f} m  [{flag}]")
-        if not plan_ok:
-            print("At least one waypoint is outside the safe envelope — aborting. Robot NOT moved.")
-            return
-
-        print("\nConfirm the path above clears the camera and stand before moving.")
-        print("  Ensure the workspace is clear of people/obstacles and the e-stop is within reach.")
-        print("  The robot must be powered on and in 'Remote Control' mode.")
-        ans = input("Type 'yes' to move, anything else to abort: ").strip().lower()
-        if ans != "yes":
-            print("Aborted by user — robot NOT moved.")
-            return
-
-        print("\nExecuting staged move...")
-        reached_all = True
-        achieved = None
-        for label, wp in waypoints:
-            ok, achieved = move_segment(rtde_c, rtde_r, label, wp)
-            if not ok:
-                reached_all = False
-                print("Stopping — remaining waypoints skipped.")
-                break
-
-        if reached_all and achieved is not None:
-            target_xyz = np.array(waypoints[-1][1][:3])
-            delta = float(np.linalg.norm(np.array(achieved[:3]) - target_xyz))
-            if delta < 0.01:
-                print(f"\nREACHED standoff (delta {delta * 1000:.1f} mm).")
-            else:
-                print(f"\nDID NOT REACH cleanly — off by {delta * 1000:.1f} mm.")
-            print(f"Final TCP pose: {np.round(achieved, 4)}")
-        else:
-            print("\nDID NOT REACH — motion stopped early (see failed segment above).")
-            if achieved is not None:
-                print(f"Final TCP pose: {np.round(achieved, 4)}")
-
-    finally:
-        try:
-            rtde_c.stopScript()
-        except Exception:
-            pass
-        rtde_c.disconnect()
-        rtde_r.disconnect()
-        print("Done. Robot stopped; exiting.")
+    print(f"Normal (base frame):        {np.round(normal_base, 4)}")
+    print("Done — verify with verify_pick.py; the robot side gets this via pose_service.py.")
 
 
 if __name__ == "__main__":

@@ -1,2 +1,3 @@
 batch,capture_id,timestamp,files
 01,1,2026-07-02T17:20:07.315326,C:\Users\sudha\Downloads\cap\cap\dataset\package_variant_1\rgb\batch_01_0001.png; C:\Users\sudha\Downloads\cap\cap\dataset\package_variant_1\depth\batch_01_0001.npy
+01,1,2026-07-08T14:50:25.679055,C:\Users\sudha\pickup\pose_estimation\dataset\package_variant_1\rgb\batch_01_0001.png; C:\Users\sudha\pickup\pose_estimation\dataset\package_variant_1\depth\batch_01_0001.npy

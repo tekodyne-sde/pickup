@@ -6,4 +6,5 @@ Pillow
 ultralytics
 open3d
 scipy
-ur_rtde
+fastapi
+uvicorn

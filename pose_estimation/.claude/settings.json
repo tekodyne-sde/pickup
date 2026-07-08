@@ -3,7 +3,10 @@
     "allow": [
       "Bash(python -m pip install ultralytics open3d scipy)",
       "Bash(python -c \"import capture_gui; print\\('HAS_POSE =', capture_gui.HAS_POSE\\)\")",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -)",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in \\('pose.py','robot_pick.py'\\)]; print\\('syntax ok'\\)\")",
+      "Bash(python test_grasp_selection.py)"
     ]
   }
 }
