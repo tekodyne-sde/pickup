@@ -1,0 +1,77 @@
+PS C:\Users\sudha\pickup\pose_estimation> python robot_pick.py
+Loaded hand-eye calibration:
+  intrinsics: fx=1489.53 fy=1487.65 cx=963.35 cy=542.04  (D loaded, not applied)
+  T_base_cam:
+[[    0.99972   -0.023254   0.0051307    -0.31382]
+ [  -0.023332     -0.9996    0.015751    -0.40029]
+ [  0.0047624   -0.015866    -0.99986     0.69477]
+ [          0           0           0           1]]
+Loading YOLO: best.pt
+Loading SAM: sam2.1_t.pt
+
+Capturing frame and detecting parcel...
+Detected: white_bag (conf=0.886)
+
+Grasp pose (camera frame):
+  position (m): [     0.0317      0.0343      0.4486]
+  normal:       [    -0.2739     -0.1801     -0.9448]
+  flatness:     0.00140  inliers: 238
+
+Standoff target (base frame, 10 cm along +normal):
+  xyz (m):      [-0.3081, -0.4111, 0.3404]
+  rotvec (rad): [0.6834, 2.7406, -0.1452]
+  reach radius: 0.514 m (limit 0.85 m), z=0.340 m
+
+About to move the UR5 at 192.168.1.10 to the standoff pose above the pick.
+  speed=0.1 m/s, accel=0.3 m/s^2, blocking moveL.
+  Ensure the workspace is clear of people/obstacles and the e-stop is within reach.
+  The robot must be powered on and in 'Remote Control' mode.
+Type 'yes' to move, anything else to abort: yes
+Connecting to UR5 at 192.168.1.10...
+Current TCP pose: [    -0.3129     -0.1825      0.2946     -2.7261     -1.5022     -0.0601]
+Moving...
+Move complete. Achieved TCP pose: [      -0.31     -0.3203      0.3221      1.6024      2.4764     -0.0725]
+[2026-07-08 12:03:47.726] [depthai] [error] Communication exception - possible device error/misconfiguration. Original message 'Couldn't read data from stream: '__x_0_0' (X_LINK_ERROR)'
+[2026-07-08 12:03:47.729] [depthai] [error] Communication exception - possible device error/misconfiguration. Original message 'Couldn't read data from stream: '__x_3_depth' (X_LINK_ERROR)'
+[2026-07-08 12:03:48.800] [ThreadedNode] [error] Node threw exception, stopping the node. Exception message: Communication exception - possible device error/misconfiguration. Original message 'Couldn't read data from stream: '__x_0_0' (X_LINK_ERROR)'
+[2026-07-08 12:03:48.800] [ThreadedNode] [error] Node threw exception, stopping the node. Exception message: Communication exception - possible device error/misconfiguration. Original message 'Couldn't read data from stream: '__x_3_depth' (X_LINK_ERROR)'
+Done. Robot stopped; exiting.
+PS C:\Users\sudha\pickup\pose_estimation> python robot_pick.py
+Loaded hand-eye calibration:
+  intrinsics: fx=1489.53 fy=1487.65 cx=963.35 cy=542.04  (D loaded, not applied)
+  T_base_cam:
+[[    0.99972   -0.023254   0.0051307    -0.31382]
+ [  -0.023332     -0.9996    0.015751    -0.40029]
+ [  0.0047624   -0.015866    -0.99986     0.69477]
+ [          0           0           0           1]]
+Loading YOLO: best.pt
+Loading SAM: sam2.1_t.pt
+
+Capturing frame and detecting parcel...
+Detected: brown_bag (conf=0.552)
+
+Grasp pose (camera frame):
+  position (m): [     0.0487      0.0655      0.4435]
+  normal:       [    -0.0524      0.3818     -0.9228]
+  flatness:     0.00130  inliers: 216
+
+Standoff target (base frame, 10 cm along +normal):
+  xyz (m):      [-0.2709, -0.4994, 0.3421]
+  rotvec (rad): [-1.3052, 2.5412, 0.4787]
+  reach radius: 0.568 m (limit 0.85 m), z=0.342 m
+
+About to move the UR5 at 192.168.1.10 to the standoff pose above the pick.
+  speed=0.1 m/s, accel=0.3 m/s^2, blocking moveL.
+  Ensure the workspace is clear of people/obstacles and the e-stop is within reach.
+  The robot must be powered on and in 'Remote Control' mode.
+Type 'yes' to move, anything else to abort: yes
+Connecting to UR5 at 192.168.1.10...
+Current TCP pose: [     -0.212     -0.1616      0.2863      1.6118      2.6904      0.0429]
+Moving...
+Move complete. Achieved TCP pose: [    -0.2494     -0.3761      0.3216      -0.289      2.9292      0.3641]
+[2026-07-08 12:06:10.394] [depthai] [error] Communication exception - possible device error/misconfiguration. Original message 'Couldn't read data from stream: '__x_3_depth' (X_LINK_ERROR)'
+[2026-07-08 12:06:10.406] [depthai] [error] Communication exception - possible device error/misconfiguration. Original message 'Couldn't read data from stream: '__x_0_0' (X_LINK_ERROR)'
+[2026-07-08 12:06:10.420] [ThreadedNode] [error] Node threw exception, stopping the node. Exception message: Communication exception - possible device error/misconfiguration. Original message 'Couldn't read data from stream: '__x_0_0' (X_LINK_ERROR)'
+[2026-07-08 12:06:10.420] [ThreadedNode] [error] Node threw exception, stopping the node. Exception message: Communication exception - possible device error/misconfiguration. Original message 'Couldn't read data from stream: '__x_3_depth' (X_LINK_ERROR)'
+Done. Robot stopped; exiting.
+PS C:\Users\sudha\pickup\pose_estimation> 
