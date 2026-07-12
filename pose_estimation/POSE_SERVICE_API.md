@@ -33,12 +33,17 @@ pick cycle to fail fast.
 
 ## POST /pose
 
-Returns a grasp estimate from the **latest live detection**. No request body.
+Returns a grasp estimate from a **fresh frame captured after the request arrives**
+(i.e. after the belt has stopped). No request body. The camera streams
+continuously in the background, but `/pose` does **not** use whatever frame is
+lying around — it settles briefly, then waits for a frame exposed after the call,
+so the estimate is never computed on a stale, in-transit (moving-belt) frame.
 
-Timing: normally **1–5 s** (segmentation + grasp-patch search; the camera is
-already streaming). If no parcel is in view, the service keeps retrying on
-fresh frames for up to **5 s** before answering `detected: false`. Use a
-client timeout of **30 s**. One request at a time — concurrent calls get `409`.
+Timing: a **~0.5 s settle** (lets a just-stopped package come to rest) plus
+normally **1–5 s** (segmentation + grasp-patch search). If no parcel is in view,
+the service keeps retrying on fresh frames for up to **5 s** before answering
+`detected: false`. Use a client timeout of **30 s** (the robot driver uses 90 s).
+One request at a time — concurrent calls get `409`.
 
 **Response `200` — parcel found** — all positions/lengths in **MILLIMETERS**
 ```json
@@ -59,7 +64,7 @@ client timeout of **30 s**. One request at a time — concurrent calls get `409`
 | field          | type      | meaning                                                              |
 |----------------|-----------|----------------------------------------------------------------------|
 | `detected`     | bool      | `true` = valid grasp point below                                     |
-| `class_name`   | string    | `box`, `brown_bag`, or `white_bag`                                   |
+| `class_name`   | string \| null | **Always present in every response.** Exactly `box`, `brown_bag`, or `white_bag` when `detected` is `true`; `null` in every `detected: false` body. Read this only when `detected` is `true`. |
 | `confidence`   | number    | detector confidence 0–1 (always ≥ 0.75 — weaker detections are treated as no object) |
 | `pick_base`    | [x,y,z]   | **grasp point in the ROBOT BASE frame, millimeters** — the value you move to. Already transformed with our hand-eye calibration. |
 | `normal_base`  | [x,y,z]   | surface normal at the grasp point, base frame, **unit vector (no unit)**, points up out of the parcel |
@@ -70,13 +75,14 @@ client timeout of **30 s**. One request at a time — concurrent calls get `409`
 
 **Response `200` — nothing usable in view**
 ```json
-{ "detected": false, "message": "no parcel detected within 5 s" }
+{ "detected": false, "class_name": null, "message": "no parcel detected within 5 s" }
 ```
 Other `detected: false` messages: `"parcel detected but no valid grasp pose"`,
 `"estimation failed on this frame: <reason>"` (bad frame — just request again),
-and `"cancelled by /reset"`. When a detection existed, these also include
-`class_name`, `confidence`, and `debug_prefix` so you can see what it saw.
-Not an error — check `detected` before using any field.
+and `"cancelled by /reset"`. Every `detected: false` body includes
+`class_name: null`; the estimation-failure branches also include `debug_prefix`
+so you can inspect what it saw. Not an error — check `detected` before using any
+field, and read `class_name` only when `detected` is `true`.
 
 **Errors** (body: `{ "detail": "<reason>" }`)
 
