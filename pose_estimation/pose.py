@@ -229,11 +229,20 @@ class GraspPoseEstimator:
             return np.array([x, y, z])
 
         p1_3d, p2_3d = deproj(p1), deproj(p2)
+        # OBB corners can land outside the object / in depth holes (z=0) —
+        # the axis is then meaningless and would build a null rotation matrix.
+        if p1_3d[2] <= 0 or p2_3d[2] <= 0:
+            return None
         long_axis = p2_3d - p1_3d
-        long_axis = long_axis / (np.linalg.norm(long_axis) + 1e-8)
+        norm = np.linalg.norm(long_axis)
+        if norm < 1e-6:
+            return None
+        long_axis = long_axis / norm
         long_axis_proj = long_axis - np.dot(long_axis, normal) * normal
-        long_axis_proj = long_axis_proj / (np.linalg.norm(long_axis_proj) + 1e-8)
-        return long_axis_proj
+        norm = np.linalg.norm(long_axis_proj)
+        if norm < 1e-6:
+            return None
+        return long_axis_proj / norm
 
     def build_pose(self, position, normal, x_axis):
         z_axis = normal
@@ -261,6 +270,14 @@ class GraspPoseEstimator:
             return None, pcd
 
         x_axis = self.compute_yaw_axis(obb_corners_2d, depth_map, patch_result['normal'])
+        if x_axis is None:
+            # OBB corners had no usable depth — yaw is arbitrary, so use any
+            # axis orthogonal to the normal (the robot uses position only).
+            print("  [warn] no depth at OBB corners — using fallback yaw axis")
+            n = patch_result['normal']
+            ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            x_axis = np.cross(n, ref)
+            x_axis = x_axis / np.linalg.norm(x_axis)
         pose = self.build_pose(patch_result['position'], patch_result['normal'], x_axis)
         pose['normal'] = patch_result['normal']
         pose['flatness_score'] = patch_result['flatness_score']

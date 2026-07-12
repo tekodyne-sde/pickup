@@ -8,3 +8,4 @@ open3d
 scipy
 fastapi
 uvicorn
+ur_rtde

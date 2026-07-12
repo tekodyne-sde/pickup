@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# DepthAI cache / telemetry
+.cache/
+
+# Debug artifacts written by robot_pick.py / pose.py
+debug_pick_*
+
+# Captured datasets
+dataset/
+
+# Screen recorder junk
+ScreenCamera_*.json
+ScreenCapture_*.png
+
+# Logs
+log.txt
+*.log

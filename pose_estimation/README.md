@@ -4,6 +4,52 @@ A high-performance GUI application for capturing synchronized RGB and depth data
 
 This app merges the DepthAI v3 pipeline architecture (for reliable, high-speed stereo capture) with a modern `CustomTkinter` interface. It generates lossless 1080p `.png` RGB images and raw 16-bit `.npy` depth matrices.
 
+## Setup on a New Machine (read this first)
+
+Everything a colleague needs to go from a fresh clone to a running tool.
+
+### 1. Prerequisites
+- **Python 3.12** (developed on 3.12.6). 3.10+ should work; stick to 3.12 to match.
+- **Git**, to clone the repo.
+- **A GPU is optional.** `ultralytics` pulls in PyTorch automatically and runs on CPU if no CUDA GPU is present — inference is just slower.
+
+### 2. Files that must be present (not always in git)
+These are required at runtime and are large binaries — confirm they came across with the clone/copy, or ask for them separately:
+| File | Needed by | Notes |
+|---|---|---|
+| `best.pt` | `pose.py`, `robot_pick.py`, `pose_service.py` | YOLO-OBB parcel detector. **Must be supplied** — not downloadable. |
+| `sam2.1_t.pt` | same | SAM segmentation model. Auto-downloads (~40 MB) on first run if missing. |
+| `handeye_result.npz` | `robot_pick.py`, `pose_service.py` | Hand-eye calibration (`T_base_cam`, `K`, `D`). **Cell-specific — must be supplied.** Not needed for `capture_gui.py` or `pose.py`. |
+
+### 3. Create the environment and install
+**Windows (automatic):** double-click `setup.bat`, or from a terminal in this folder:
+```cmd
+setup.bat
+```
+This creates `venv\` and installs everything in `requirements.txt`.
+
+**Manual (any OS):**
+```cmd
+python -m venv venv
+venv\Scripts\activate        # Windows;  source venv/bin/activate on macOS/Linux
+pip install -r requirements.txt
+```
+First install is large (PyTorch + Open3D + DepthAI) — allow a few minutes.
+
+### 4. Hardware
+- **OAK-D** stereo camera connected via USB (required by every tool except a pure model test).
+- **UR5 robot** reachable on the network in **Remote Control** mode — only for `robot_pick.py`.
+
+### 5. Pick an entry point
+| Command | What it does | Needs camera | Needs robot |
+|---|---|---|---|
+| `python capture_gui.py` | GUI to capture RGB+depth datasets | ✅ | — |
+| `python pose.py` | Live 6-DoF grasp pose, no robot motion | ✅ | — |
+| `python robot_pick.py` | One-shot: detect → move UR5 to standoff above pick | ✅ | ✅ |
+| `python pose_service.py` | FastAPI pose service on port 8001 (see `POSE_SERVICE_API.md`) | ✅ | — |
+
+Details for each are in the sections below. If you just want to confirm the environment works without hardware, run `python -c "import torch, ultralytics, depthai, open3d; print('ok')"`.
+
 ## Features
 - **Live Side-by-Side View:** Native 1080p RGB feed paired with a real-time depth heatmap.
 - **Batch Tracking:** Configurable Variant Name and Batch Number parameters to seamlessly organize your datasets on disk.

@@ -4,32 +4,41 @@ We are the **ML service**: camera + detection + grasp-point estimation only.
 We do **not** connect to or control the robot. Your side calls this API to get
 the pick point, then plans and executes the motion yourself.
 
-Interactive docs (try it in a browser): `http://<ml-host>:8000/docs`
+Interactive docs (try it in a browser): `http://<ml-host>:8001/docs`
 
 ## Service startup (ML side)
 
 ```
-uvicorn pose_service:app --host 0.0.0.0 --port 8000
+uvicorn pose_service:app --host 0.0.0.0 --port 8001
 ```
 
-Base URL: `http://<ml-host>:8000`. No auth — keep it on the internal network.
+Base URL: `http://<ml-host>:8001`. No auth — keep it on the internal network.
 
 ---
 
 ## GET /health
 
-Liveness check. Returns `{ "ok": true }`. Call before a pick cycle if you want
-to fail fast when the ML service is down.
+Liveness check:
+```json
+{ "ok": true, "camera_live": true, "parcel_in_view": true, "estimating_for_s": 0 }
+```
+`estimating_for_s` > 0 means a `/pose` request is currently being processed
+(and how long it has been running).
+The camera streams and detects **continuously** in the background.
+`camera_live: false` means the camera is starting up or reconnecting after a
+drop — a `POST /pose` sent now will likely return `503`. Call this before a
+pick cycle to fail fast.
 
 ---
 
 ## POST /pose
 
-Triggers ONE camera capture + detection + grasp estimation. No request body.
+Returns a grasp estimate from the **latest live detection**. No request body.
 
-Timing: expect **5–15 s** (camera autofocus settle ~3 s + model inference; up
-to +5 s more if the camera hiccups and we retry internally). Use a client
-timeout of **60 s**. One request at a time — concurrent calls get `409`.
+Timing: normally **1–5 s** (segmentation + grasp-patch search; the camera is
+already streaming). If no parcel is in view, the service keeps retrying on
+fresh frames for up to **5 s** before answering `detected: false`. Use a
+client timeout of **30 s**. One request at a time — concurrent calls get `409`.
 
 **Response `200` — parcel found** — all positions/lengths in **MILLIMETERS**
 ```json
@@ -51,26 +60,45 @@ timeout of **60 s**. One request at a time — concurrent calls get `409`.
 |----------------|-----------|----------------------------------------------------------------------|
 | `detected`     | bool      | `true` = valid grasp point below                                     |
 | `class_name`   | string    | `box`, `brown_bag`, or `white_bag`                                   |
-| `confidence`   | number    | detector confidence 0–1                                              |
+| `confidence`   | number    | detector confidence 0–1 (always ≥ 0.75 — weaker detections are treated as no object) |
 | `pick_base`    | [x,y,z]   | **grasp point in the ROBOT BASE frame, millimeters** — the value you move to. Already transformed with our hand-eye calibration. |
 | `normal_base`  | [x,y,z]   | surface normal at the grasp point, base frame, **unit vector (no unit)**, points up out of the parcel |
 | `position_cam` / `normal_cam` | [x,y,z] | same data in the camera frame (mm / unit vector), for cross-checking |
 | `flatness_mm`  | number    | mean plane residual of the chosen patch, mm (smaller = flatter)      |
 | `inliers`      | int       | points supporting the patch plane fit                                |
-| `debug_prefix` | string    | debug artifacts saved ML-side (`<prefix>.png` red-dot image, `.ply` point cloud, `.npz` coordinates — npz/ply are in METERS, internal use) |
+| `debug_prefix` | string    | debug artifacts saved ML-side: `<prefix>_detect.png` (raw detection box, saved BEFORE any calculation), `<prefix>.png` (red-dot grasp image), `.ply` point cloud, `.npz` coordinates — npz/ply are in METERS, internal use |
 
 **Response `200` — nothing usable in view**
 ```json
-{ "detected": false, "message": "no parcel detected or no valid grasp pose" }
+{ "detected": false, "message": "no parcel detected within 5 s" }
 ```
-Not an error — the bin may be empty. Check `detected` before using any field.
+Other `detected: false` messages: `"parcel detected but no valid grasp pose"`,
+`"estimation failed on this frame: <reason>"` (bad frame — just request again),
+and `"cancelled by /reset"`. When a detection existed, these also include
+`class_name`, `confidence`, and `debug_prefix` so you can see what it saw.
+Not an error — check `detected` before using any field.
 
 **Errors** (body: `{ "detail": "<reason>" }`)
 
 | status | when                                             | your handling            |
 |--------|--------------------------------------------------|--------------------------|
-| 409    | a capture is already in progress                 | wait and retry           |
-| 503    | camera failed twice (USB/firmware drop)          | retry after ~10 s; alert if persistent |
+| 409    | an estimation is already in progress             | wait and retry, or `POST /reset` |
+| 503    | camera not live (starting up or reconnecting after a USB/firmware drop) | retry after ~10 s; alert if persistent |
+
+---
+
+## POST /reset
+
+Clears a stuck cycle: **force-clears the busy slot** (even if an estimation is
+hung mid-computation), aborts any `/pose` request still waiting for a detection
+(it returns `detected: false, "cancelled by /reset"`), and clears the current
+detection state. The camera stream keeps running — no restart needed. A new
+`/pose` can be sent immediately after.
+
+```json
+{ "ok": true, "was_busy": true, "busy_for_s": 42.5,
+  "message": "busy slot force-cleared; waiting requests cancelled; detection state cleared" }
+```
 
 ---
 
@@ -78,7 +106,7 @@ Not an error — the bin may be empty. Check `detected` before using any field.
 
 A client that per pick cycle:
 
-1. `POST /pose` (timeout 60 s).
+1. `POST /pose` (timeout 30 s); optionally `GET /health` first.
 2. If `detected` is `false` → no parcel; skip the cycle.
 3. Sanity-check `pick_base` against your own workspace limits — we guarantee
    the point is on the parcel surface, not that it is reachable for your arm.
@@ -91,7 +119,7 @@ A client that per pick cycle:
 ```python
 import requests
 
-r = requests.post("http://<ml-host>:8000/pose", timeout=60)
+r = requests.post("http://<ml-host>:8001/pose", timeout=30)
 r.raise_for_status()
 data = r.json()
 if not data["detected"]:
@@ -103,7 +131,7 @@ else:
 
 **curl**
 ```bash
-curl -X POST http://<ml-host>:8000/pose
+curl -X POST http://<ml-host>:8001/pose
 ```
 
 ## Coordinate frame notes

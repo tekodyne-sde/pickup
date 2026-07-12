@@ -118,25 +118,10 @@ def capture_and_detect(rgb_queue, depth_queue, model, settle_s=CAMERA_SETTLE_S):
     return rgb_frame, depth_frame, corners, cls_name, conf
 
 
-def run_vision(model, sam_model, estimator, debug_prefix):
-    """Capture one frame, close the camera, and return the pick point (camera frame)."""
-    device = dai.Device()
-    try:
-        pipeline, rgb_out, depth_out = create_pipeline(device)
-        rgb_queue = rgb_out.createOutputQueue()
-        depth_queue = depth_out.createOutputQueue()
-        pipeline.start()
-        print("\nCapturing frame and detecting parcel...")
-        rgb_frame, depth_frame, corners, cls_name, conf = capture_and_detect(
-            rgb_queue, depth_queue, model
-        )
-    finally:
-        device.close()  # release the camera before we touch the robot
-    print("Camera closed.")
-
-    if corners is None:
-        print("No parcel detected — aborting. Robot NOT moved.")
-        return None
+def estimate_from_frame(sam_model, estimator, rgb_frame, depth_frame,
+                        corners, cls_name, conf, debug_prefix):
+    """SAM mask -> grasp pose -> debug artifacts, from an already-captured frame.
+    Returns the pose dict (with class_name/confidence) or None."""
     print(f"Detected: {cls_name} (conf={conf:.3f})")
 
     mask = mask_from_sam(sam_model, rgb_frame, corners)
@@ -148,7 +133,7 @@ def run_vision(model, sam_model, estimator, debug_prefix):
         depth_frame, mask, corners, patch_radius=SUCTION_PATCH_RADIUS, cls_name=cls_name
     )
     if pose is None:
-        print("No valid grasp pose found — aborting. Robot NOT moved.")
+        print("No valid grasp pose found.")
         return None
     pose["class_name"] = cls_name
     pose["confidence"] = conf
@@ -166,6 +151,29 @@ def run_vision(model, sam_model, estimator, debug_prefix):
     o3d.io.write_point_cloud(f"{debug_prefix}.ply", pcd)
     print(f"  Saved point cloud        -> {debug_prefix}.ply")
     return pose
+
+
+def run_vision(model, sam_model, estimator, debug_prefix):
+    """Capture one frame, close the camera, and return the pick point (camera frame)."""
+    device = dai.Device()
+    try:
+        pipeline, rgb_out, depth_out = create_pipeline(device)
+        rgb_queue = rgb_out.createOutputQueue()
+        depth_queue = depth_out.createOutputQueue()
+        pipeline.start()
+        print("\nCapturing frame and detecting parcel...")
+        rgb_frame, depth_frame, corners, cls_name, conf = capture_and_detect(
+            rgb_queue, depth_queue, model
+        )
+    finally:
+        device.close()
+    print("Camera closed.")
+
+    if corners is None:
+        print("No parcel detected.")
+        return None
+    return estimate_from_frame(sam_model, estimator, rgb_frame, depth_frame,
+                               corners, cls_name, conf, debug_prefix)
 
 
 # ============================================================
