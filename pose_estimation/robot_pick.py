@@ -52,7 +52,17 @@ FRAME_HEIGHT = 1080
 
 # Stream this long before capturing so autofocus/auto-exposure converge
 # (15 frames wasn't enough — captures came out blurry). Raise if still soft.
+# (Only used by the one-shot script path; the service locks focus instead.)
 CAMERA_SETTLE_S = 3.0
+
+# RGB (CAM_A) focus + exposure are LOCKED at startup: the camera-to-belt distance
+# is fixed, so continuous autofocus only causes hunting/soft frames when a package
+# appears, and uncapped exposure blurs a moving belt. These are HARDWARE-SPECIFIC
+# — re-tune with tune_camera.py whenever the camera is moved/recalibrated, then
+# paste the printed values here.
+RGB_LENS_POSITION = 104    # lens position 0-255 (placeholder — tune per mount)
+RGB_EXPOSURE_US = 8000     # exposure time in microseconds (cap for a moving belt)
+RGB_ISO = 400              # sensor ISO 100-1600 (pair with exposure for brightness)
 
 # All robot-side concerns (standoff, speed, clearances, path planning) belong
 # to the robot team — we only produce the pick point.
@@ -77,6 +87,11 @@ def create_pipeline(device: dai.Device):
 
     cam_rgb = pipeline.create(dai.node.Camera)
     cam_rgb.build(boardSocket=dai.CameraBoardSocket.CAM_A)
+    # Lock focus + cap exposure (fixed working distance) so a package arriving on
+    # the belt neither triggers an autofocus hunt nor motion-blurs. Applied once at
+    # pipeline start. Values are tunable constants above (see tune_camera.py).
+    cam_rgb.initialControl.setManualFocus(RGB_LENS_POSITION)
+    cam_rgb.initialControl.setManualExposure(RGB_EXPOSURE_US, RGB_ISO)
 
     cam_left = pipeline.create(dai.node.Camera)
     cam_left.build(boardSocket=dai.CameraBoardSocket.CAM_B)

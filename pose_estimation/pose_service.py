@@ -34,6 +34,7 @@ import depthai as dai
 from fastapi import FastAPI, HTTPException
 from ultralytics import YOLO, SAM
 
+import frame_capture
 from pose import GraspPoseEstimator, CLASS_NAMES, DEPTH_SCALE
 from robot_pick import (
     load_handeye,
@@ -45,10 +46,13 @@ from robot_pick import (
     SAM_MODEL_PATH,
 )
 
-INFER_EVERY_N_FRAMES = 3   # YOLO on every Nth live frame
-NO_DETECT_RETRY_S = 5.0    # a request retries on live frames this long before "no parcel"
+INFER_EVERY_N_FRAMES = 3   # background YOLO on every Nth live frame (feeds /health)
+NO_DETECT_RETRY_S = 5.0    # a request retries on fresh frames this long before "no parcel"
 LIVE_STALE_S = 5.0         # newest frame older than this => camera considered down
 MIN_CONFIDENCE = 0.75      # detections below this are treated as "no object"
+SETTLE_S = 0.5             # belt-deceleration settle before capturing (package comes to rest)
+FRESH_SKIP_FRAMES = 2      # seq must advance this much so the frame is exposed AFTER the request
+FRESH_CAPTURE_TIMEOUT_S = 3.0  # max wait for a genuinely-new frame before 503
 
 app = FastAPI(title="Parcel pose estimation service")
 _cancel = threading.Event()  # set by /reset to abort a waiting /pose request
@@ -87,12 +91,35 @@ SAM_MODEL = SAM(SAM_MODEL_PATH)
 ESTIMATOR = GraspPoseEstimator(fx=K[0, 0], fy=K[1, 1], cx=K[0, 2], cy=K[1, 2],
                                depth_scale=DEPTH_SCALE)
 
-# Latest live frame + detection, written only by the camera thread.
+# Latest background detection, written by the camera thread — feeds /health only.
 _latest = {"rgb": None, "depth": None, "corners": None,
            "cls_name": None, "conf": 0.0, "stamp": 0.0}
 _latest_lock = threading.Lock()
 _frame_stamp = [0.0]  # updated EVERY frame, even while YOLO is paused
 _estimating = threading.Event()  # pauses live YOLO only during SAM/estimation
+
+# Newest RAW frame + a monotonic seq, published EVERY frame by the camera thread.
+# A /pose request waits on this (never touches the DepthAI queues) to obtain a
+# frame captured AFTER the request — i.e. after the belt stopped.
+_capture = frame_capture.FrameBuffer()
+
+
+def _detect_obb(rgb):
+    """YOLO-OBB on one BGR frame -> (corners[4x2], cls_name, conf) for the best box
+    that is >= MIN_CONFIDENCE AND a known class; otherwise (None, None, 0.0).
+    An unknown class index clamps to no-detection (never a raw number string)."""
+    results = MODEL(rgb, verbose=False)
+    obb = results[0].obb
+    if obb is None or len(obb.cls) == 0:
+        return None, None, 0.0
+    best = int(np.argmax(obb.conf.cpu().numpy()))
+    conf = float(obb.conf[best])
+    cls_name = frame_capture.resolve_class_name(int(obb.cls[best]), conf,
+                                                MIN_CONFIDENCE, CLASS_NAMES)
+    if cls_name is None:
+        return None, None, 0.0
+    corners = obb.xyxyxyxy[best].cpu().numpy().reshape(4, 2)
+    return corners, cls_name, conf
 
 
 def _camera_loop():
@@ -102,30 +129,29 @@ def _camera_loop():
             device = dai.Device()
             try:
                 pipeline, rgb_out, depth_out = create_pipeline(device)
-                rgb_queue = rgb_out.createOutputQueue()
-                depth_queue = depth_out.createOutputQueue()
+                # maxSize=1, non-blocking: no FIFO backlog — .get() always yields
+                # the newest frame instead of the oldest buffered one.
+                rgb_queue = rgb_out.createOutputQueue(maxSize=1, blocking=False)
+                depth_queue = depth_out.createOutputQueue(maxSize=1, blocking=False)
                 pipeline.start()
                 print("[camera] live")
                 n = 0
                 while True:
-                    rgb = rgb_queue.get().getCvFrame()
-                    depth = depth_queue.get().getFrame()  # uint16 mm
+                    rgb_msg = rgb_queue.get()
+                    depth_msg = depth_queue.get()
+                    rgb = rgb_msg.getCvFrame()
+                    depth = depth_msg.getFrame()  # uint16 mm
                     _frame_stamp[0] = time.time()
+                    # Publish the newest raw frame EVERY iteration (before the YOLO
+                    # skip) so a /pose request can wait for a genuinely post-request
+                    # frame even while background YOLO is paused during estimation.
+                    _capture.publish(rgb, depth, rgb_msg.getTimestamp().total_seconds())
                     n += 1
-                    # Skip live YOLO only while SAM/estimation runs (they fight
-                    # for the CPU and estimations crawl). NOT while a request
-                    # merely waits for a detection — it needs YOLO running.
+                    # Background YOLO (feeds /health) skips every non-Nth frame and
+                    # pauses entirely while SAM/estimation runs (they fight for CPU).
                     if n % INFER_EVERY_N_FRAMES or _estimating.is_set():
                         continue
-                    results = MODEL(rgb, verbose=False)
-                    obb = results[0].obb
-                    corners, cls_name, conf = None, None, 0.0
-                    if obb is not None and len(obb.cls) > 0:
-                        best = int(np.argmax(obb.conf.cpu().numpy()))
-                        if float(obb.conf[best]) >= MIN_CONFIDENCE:
-                            corners = obb.xyxyxyxy[best].cpu().numpy().reshape(4, 2)
-                            cls_name = CLASS_NAMES.get(int(obb.cls[best]), str(int(obb.cls[best])))
-                            conf = float(obb.conf[best])
+                    corners, cls_name, conf = _detect_obb(rgb)
                     with _latest_lock:
                         _latest.update(rgb=rgb, depth=depth, corners=corners,
                                        cls_name=cls_name, conf=conf, stamp=time.time())
@@ -159,6 +185,54 @@ def _save_detection_png(snap, debug_prefix):
     path = f"{debug_prefix}_detect.png"
     cv2.imwrite(path, vis)
     return path
+
+
+def _run_estimation(snap):
+    """SAM -> grasp pose -> debug artifacts -> response body, from a detected frame.
+    Caller MUST already hold the busy slot and have _estimating set. Never raises on
+    a bad frame — a failure becomes a detected:false body (class_name null)."""
+    debug_prefix = time.strftime("debug_pick_%Y%m%d_%H%M%S")
+    detect_png = _save_detection_png(snap, debug_prefix)
+    print(f"[pose] request: detected {snap['cls_name']} "
+          f"(conf={snap['conf']:.3f}) -> {detect_png}")
+
+    t0 = time.time()
+    try:
+        pose = estimate_from_frame(SAM_MODEL, ESTIMATOR, snap["rgb"], snap["depth"],
+                                   snap["corners"], snap["cls_name"], snap["conf"],
+                                   debug_prefix)
+        print(f"[pose] estimation took {time.time() - t0:.1f} s")
+    except Exception as exc:
+        # Never let a bad frame 500 the API — report it as a failed estimate.
+        traceback.print_exc()
+        return frame_capture.no_detection_response(
+            f"estimation failed on this frame: {exc}", debug_prefix=debug_prefix)
+    if pose is None:
+        return frame_capture.no_detection_response(
+            "parcel detected but no valid grasp pose", debug_prefix=debug_prefix)
+
+    pick_base = pick_point_base(T_BASE_CAM, pose["position"])
+    normal_base = T_BASE_CAM[:3, :3] @ pose["normal"]
+    np.savez(f"{debug_prefix}.npz",
+             position_cam=pose["position"], normal_cam=pose["normal"],
+             T_base_cam=T_BASE_CAM, pick_base=pick_base)
+    print(f"[pose] pick pose: base (mm)={np.round(pick_base * 1000, 1)} "
+          f"normal={np.round(normal_base, 4)} "
+          f"class={pose['class_name']} conf={pose['confidence']:.3f}")
+
+    # API positions/lengths are in MILLIMETERS; internal math/npz stay in meters.
+    mm = lambda vec: [round(float(v) * 1000, 1) for v in vec]
+    return frame_capture.detection_response(
+        class_name=pose["class_name"],
+        confidence=pose["confidence"],
+        pick_base=mm(pick_base),
+        normal_base=[round(float(v), 4) for v in normal_base],
+        position_cam=mm(pose["position"]),
+        normal_cam=[round(float(v), 4) for v in pose["normal"]],
+        flatness_mm=round(float(pose["flatness_score"]) * 1000, 2),
+        inliers=int(pose["inlier_count"]),
+        debug_prefix=debug_prefix,
+    )
 
 
 @app.get("/health")
@@ -195,7 +269,14 @@ def reset():
 
 @app.post("/pose")
 def estimate_pose():
-    """Grasp point from the latest live detection; retries while nothing is in view."""
+    """Grasp point from a FRESH frame captured AFTER this request arrives.
+
+    Flow: settle (let the just-stopped belt/package come to rest) -> wait for a
+    frame exposed after the request (never the stale FIFO backlog) -> detect on
+    THAT frame -> SAM + grasp estimate. Retries on subsequent fresh frames while
+    nothing is in view, up to NO_DETECT_RETRY_S. class_name is present in every
+    response and is null whenever detected is false.
+    """
     token = _acquire_busy()
     if token is None:
         busy_for = time.time() - _busy_since
@@ -204,78 +285,40 @@ def estimate_pose():
                                    f"(POST /reset to force-clear)")
     try:
         _cancel.clear()
-        # Wait for a fresh frame WITH a detection, up to the retry window.
-        deadline = time.time() + NO_DETECT_RETRY_S
-        while True:
-            if _cancel.is_set():
-                return {"detected": False, "message": "cancelled by /reset"}
-            with _latest_lock:
-                snap = dict(_latest)
-            if _detection_fresh(snap) and snap["corners"] is not None:
-                break
-            if time.time() >= deadline:
-                if not _camera_is_live():
-                    raise HTTPException(status_code=503,
-                                        detail="camera not live (starting or reconnecting) — try again")
-                return {"detected": False,
-                        "message": f"no parcel detected within {NO_DETECT_RETRY_S:.0f} s"}
-            time.sleep(0.3)
+        if not _camera_is_live():
+            raise HTTPException(status_code=503,
+                                detail="camera not live (starting or reconnecting) — try again")
 
-        # Log + save what the detector saw BEFORE any calculation, so false
-        # positives on an empty bin can be audited.
-        debug_prefix = time.strftime("debug_pick_%Y%m%d_%H%M%S")
-        detect_png = _save_detection_png(snap, debug_prefix)
-        print(f"[pose] request: detected {snap['cls_name']} "
-              f"(conf={snap['conf']:.3f}) -> {detect_png}")
+        # Settle: the belt stop is a servo velocity->0; give the package a moment
+        # to come to rest before we freeze a frame.
+        if not frame_capture.sleep_with_cancel(SETTLE_S, _cancel):
+            return frame_capture.no_detection_response("cancelled by /reset")
 
-        t0 = time.time()
-        _estimating.set()  # pause live YOLO so it doesn't compete with SAM
+        _estimating.set()  # pause background YOLO so it doesn't compete with our YOLO+SAM
         try:
-            pose = estimate_from_frame(SAM_MODEL, ESTIMATOR, snap["rgb"], snap["depth"],
-                                       snap["corners"], snap["cls_name"], snap["conf"],
-                                       debug_prefix)
-            print(f"[pose] estimation took {time.time() - t0:.1f} s")
-        except Exception as exc:
-            # Never let a bad frame 500 the API — report it as a failed estimate.
-            traceback.print_exc()
-            return {"detected": False,
-                    "message": f"estimation failed on this frame: {exc}",
-                    "class_name": snap["cls_name"],
-                    "confidence": round(float(snap["conf"]), 3),
-                    "debug_prefix": debug_prefix}
+            deadline = time.time() + NO_DETECT_RETRY_S
+            while True:
+                res = frame_capture.wait_for_fresh_frame(
+                    _capture, FRESH_SKIP_FRAMES, FRESH_CAPTURE_TIMEOUT_S,
+                    _cancel, _camera_is_live)
+                if res["status"] == "cancelled":
+                    return frame_capture.no_detection_response("cancelled by /reset")
+                if res["status"] == "timeout":
+                    raise HTTPException(status_code=503,
+                                        detail="camera stalled — no fresh frame; try again")
+
+                fresh = res["frame"]
+                corners, cls_name, conf = _detect_obb(fresh["rgb"])
+                if corners is not None:
+                    snap = {"rgb": fresh["rgb"], "depth": fresh["depth"],
+                            "corners": corners, "cls_name": cls_name, "conf": conf}
+                    return _run_estimation(snap)
+                if time.time() >= deadline:
+                    return frame_capture.no_detection_response(
+                        f"no parcel detected within {NO_DETECT_RETRY_S:.0f} s")
+                # else: loop and grab the next fresh frame to retry detection
         finally:
             _estimating.clear()
-        if pose is None:
-            return {"detected": False,
-                    "message": "parcel detected but no valid grasp pose",
-                    "class_name": snap["cls_name"],
-                    "confidence": round(float(snap["conf"]), 3),
-                    "debug_prefix": debug_prefix}
-
-        pick_base = pick_point_base(T_BASE_CAM, pose["position"])
-        normal_base = T_BASE_CAM[:3, :3] @ pose["normal"]
-        np.savez(f"{debug_prefix}.npz",
-                 position_cam=pose["position"], normal_cam=pose["normal"],
-                 T_base_cam=T_BASE_CAM, pick_base=pick_base)
-        print(f"[pose] pick pose: base (mm)={np.round(pick_base * 1000, 1)} "
-              f"normal={np.round(normal_base, 4)} "
-              f"class={pose['class_name']} conf={pose['confidence']:.3f}")
-
-        # API positions/lengths are in MILLIMETERS (robot side asked for mm).
-        # Internal math and the debug .npz stay in meters.
-        mm = lambda vec: [round(float(v) * 1000, 1) for v in vec]
-        return {
-            "detected": True,
-            "class_name": pose["class_name"],
-            "confidence": round(float(pose["confidence"]), 3),
-            "pick_base": mm(pick_base),
-            "normal_base": [round(float(v), 4) for v in normal_base],
-            "position_cam": mm(pose["position"]),
-            "normal_cam": [round(float(v), 4) for v in pose["normal"]],
-            "flatness_mm": round(float(pose["flatness_score"]) * 1000, 2),
-            "inliers": int(pose["inlier_count"]),
-            "debug_prefix": debug_prefix,
-        }
     finally:
         _release_busy(token)
 
