@@ -54,6 +54,22 @@ SETTLE_S = 0.5             # belt-deceleration settle before capturing (package 
 FRESH_SKIP_FRAMES = 2      # seq must advance this much so the frame is exposed AFTER the request
 FRESH_CAPTURE_TIMEOUT_S = 3.0  # max wait for a genuinely-new frame before 503
 
+
+def _env_flag(name, default=True):
+    """Read a boolean env var; '0'/'false'/'no'/'off' (any case) => False."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in ("0", "false", "no", "off")
+
+
+# The service is usually launched as `uvicorn pose_service:app`, which imports
+# this module rather than calling a main(), so these behaviour toggles come from
+# env vars (POSE_DEBUG / POSE_USE_FLATNESS). Running `python pose_service.py`
+# additionally accepts --no-debug / --no-flatness, which override the env vars.
+CREATE_DEBUG = _env_flag("POSE_DEBUG", True)      # save per-request debug artifacts
+USE_FLATNESS = _env_flag("POSE_USE_FLATNESS", True)  # False => bounding-box-center pick
+
 app = FastAPI(title="Parcel pose estimation service")
 _cancel = threading.Event()  # set by /reset to abort a waiting /pose request
 
@@ -192,15 +208,19 @@ def _run_estimation(snap):
     Caller MUST already hold the busy slot and have _estimating set. Never raises on
     a bad frame — a failure becomes a detected:false body (class_name null)."""
     debug_prefix = time.strftime("debug_pick_%Y%m%d_%H%M%S")
-    detect_png = _save_detection_png(snap, debug_prefix)
-    print(f"[pose] request: detected {snap['cls_name']} "
-          f"(conf={snap['conf']:.3f}) -> {detect_png}")
+    if CREATE_DEBUG:
+        detect_png = _save_detection_png(snap, debug_prefix)
+        print(f"[pose] request: detected {snap['cls_name']} "
+              f"(conf={snap['conf']:.3f}) -> {detect_png}")
+    else:
+        print(f"[pose] request: detected {snap['cls_name']} (conf={snap['conf']:.3f})")
 
     t0 = time.time()
     try:
         pose = estimate_from_frame(SAM_MODEL, ESTIMATOR, snap["rgb"], snap["depth"],
                                    snap["corners"], snap["cls_name"], snap["conf"],
-                                   debug_prefix)
+                                   debug_prefix, create_debug=CREATE_DEBUG,
+                                   use_flatness=USE_FLATNESS)
         print(f"[pose] estimation took {time.time() - t0:.1f} s")
     except Exception as exc:
         # Never let a bad frame 500 the API — report it as a failed estimate.
@@ -213,13 +233,18 @@ def _run_estimation(snap):
 
     pick_base = pick_point_base(T_BASE_CAM, pose["position"])
     normal_base = T_BASE_CAM[:3, :3] @ pose["normal"]
-    np.savez(f"{debug_prefix}.npz",
-             position_cam=pose["position"], normal_cam=pose["normal"],
-             T_base_cam=T_BASE_CAM, pick_base=pick_base)
+    if CREATE_DEBUG:
+        np.savez(f"{debug_prefix}.npz",
+                 position_cam=pose["position"], normal_cam=pose["normal"],
+                 T_base_cam=T_BASE_CAM, pick_base=pick_base)
     print(f"[pose] pick pose: base (mm)={np.round(pick_base * 1000, 1)} "
           f"normal={np.round(normal_base, 4)} "
           f"class={pose['class_name']} conf={pose['confidence']:.3f}")
 
+    # In bounding-box-center mode there is no flat-patch residual, so flatness is
+    # NaN — emit JSON null (NaN is not valid JSON) rather than a bogus number.
+    flatness = float(pose["flatness_score"])
+    flatness_mm = round(flatness * 1000, 2) if np.isfinite(flatness) else None
     # API positions/lengths are in MILLIMETERS; internal math/npz stay in meters.
     mm = lambda vec: [round(float(v) * 1000, 1) for v in vec]
     return frame_capture.detection_response(
@@ -229,7 +254,7 @@ def _run_estimation(snap):
         normal_base=[round(float(v), 4) for v in normal_base],
         position_cam=mm(pose["position"]),
         normal_cam=[round(float(v), 4) for v in pose["normal"]],
-        flatness_mm=round(float(pose["flatness_score"]) * 1000, 2),
+        flatness_mm=flatness_mm,
         inliers=int(pose["inlier_count"]),
         debug_prefix=debug_prefix,
     )
@@ -324,6 +349,23 @@ def estimate_pose():
 
 
 if __name__ == "__main__":
+    import argparse
+
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="Parcel pose estimation FastAPI service.")
+    parser.add_argument("--no-debug", action="store_true",
+                        help="do not save per-request debug artifacts (overrides POSE_DEBUG)")
+    parser.add_argument("--no-flatness", action="store_true",
+                        help="skip the flatness detector; pick the bounding-box center "
+                             "(overrides POSE_USE_FLATNESS)")
+    args = parser.parse_args()
+    # CLI flags override the env-var defaults resolved at import time.
+    if args.no_debug:
+        CREATE_DEBUG = False
+    if args.no_flatness:
+        USE_FLATNESS = False
+    print(f"[pose] debug artifacts: {'on' if CREATE_DEBUG else 'off'} | "
+          f"grasp mode: {'flatness detector' if USE_FLATNESS else 'bounding-box center'}")
 
     uvicorn.run(app, host="0.0.0.0", port=8001)

@@ -15,6 +15,7 @@ POSE_SERVICE_API.md) — the robot side consumes the pick point and does all
 motion itself.
 """
 
+import argparse
 import os
 import time
 
@@ -134,9 +135,13 @@ def capture_and_detect(rgb_queue, depth_queue, model, settle_s=CAMERA_SETTLE_S):
 
 
 def estimate_from_frame(sam_model, estimator, rgb_frame, depth_frame,
-                        corners, cls_name, conf, debug_prefix):
+                        corners, cls_name, conf, debug_prefix,
+                        create_debug=True, use_flatness=True):
     """SAM mask -> grasp pose -> debug artifacts, from an already-captured frame.
-    Returns the pose dict (with class_name/confidence) or None."""
+    Returns the pose dict (with class_name/confidence) or None.
+
+    create_debug=False skips the annotated-PNG/point-cloud artifacts; use_flatness
+    =False bypasses the flatness detector and picks the bounding-box center."""
     print(f"Detected: {cls_name} (conf={conf:.3f})")
 
     mask = mask_from_sam(sam_model, rgb_frame, corners)
@@ -145,7 +150,8 @@ def estimate_from_frame(sam_model, estimator, rgb_frame, depth_frame,
         mask = mask_from_obb(corners, rgb_frame.shape)
 
     pose, pcd = estimator.estimate(
-        depth_frame, mask, corners, patch_radius=SUCTION_PATCH_RADIUS, cls_name=cls_name
+        depth_frame, mask, corners, patch_radius=SUCTION_PATCH_RADIUS, cls_name=cls_name,
+        use_flatness=use_flatness
     )
     if pose is None:
         print("No valid grasp pose found.")
@@ -160,15 +166,17 @@ def estimate_from_frame(sam_model, estimator, rgb_frame, depth_frame,
 
     # Debug artifacts: annotated PNG (red dot = pick pixel) + camera-frame point
     # cloud of the parcel, so the commanded coordinates can be verified offline.
-    save_annotated_snapshot(rgb_frame, corners, cls_name, pose,
-                            estimator.fx, estimator.fy, estimator.cx, estimator.cy,
-                            f"{debug_prefix}.png", mask=mask)
-    o3d.io.write_point_cloud(f"{debug_prefix}.ply", pcd)
-    print(f"  Saved point cloud        -> {debug_prefix}.ply")
+    if create_debug:
+        save_annotated_snapshot(rgb_frame, corners, cls_name, pose,
+                                estimator.fx, estimator.fy, estimator.cx, estimator.cy,
+                                f"{debug_prefix}.png", mask=mask)
+        o3d.io.write_point_cloud(f"{debug_prefix}.ply", pcd)
+        print(f"  Saved point cloud        -> {debug_prefix}.ply")
     return pose
 
 
-def run_vision(model, sam_model, estimator, debug_prefix):
+def run_vision(model, sam_model, estimator, debug_prefix,
+               create_debug=True, use_flatness=True):
     """Capture one frame, close the camera, and return the pick point (camera frame)."""
     device = dai.Device()
     try:
@@ -188,7 +196,8 @@ def run_vision(model, sam_model, estimator, debug_prefix):
         print("No parcel detected.")
         return None
     return estimate_from_frame(sam_model, estimator, rgb_frame, depth_frame,
-                               corners, cls_name, conf, debug_prefix)
+                               corners, cls_name, conf, debug_prefix,
+                               create_debug=create_debug, use_flatness=use_flatness)
 
 
 # ============================================================
@@ -205,6 +214,18 @@ def pick_point_base(T_base_cam, position_cam):
 # Main
 # ============================================================
 def main():
+    parser = argparse.ArgumentParser(
+        description="One-shot parcel pick-point estimation (OAK-D, ML side only).")
+    parser.add_argument("--no-debug", action="store_true",
+                        help="do not save debug artifacts (.png annotated image, .ply cloud, .npz coords)")
+    parser.add_argument("--no-flatness", action="store_true",
+                        help="skip the flatness detector; pick the bounding-box center instead")
+    args = parser.parse_args()
+    create_debug = not args.no_debug
+    use_flatness = not args.no_flatness
+    print(f"debug artifacts: {'on' if create_debug else 'off'} | "
+          f"grasp mode: {'flatness detector' if use_flatness else 'bounding-box center'}")
+
     T_base_cam, K, D = load_handeye(HANDEYE_NPZ)
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     print("Loaded hand-eye calibration:")
@@ -222,21 +243,24 @@ def main():
     # ponytail: one retry — the OAK-D watchdog reboots the device after a
     # firmware crash, so a second open usually succeeds.
     try:
-        pose = run_vision(model, sam_model, estimator, debug_prefix)
+        pose = run_vision(model, sam_model, estimator, debug_prefix,
+                          create_debug=create_debug, use_flatness=use_flatness)
     except RuntimeError as exc:
         print(f"Camera error: {exc}\nRetrying once in 5 s...")
         time.sleep(5)
-        pose = run_vision(model, sam_model, estimator, debug_prefix)
+        pose = run_vision(model, sam_model, estimator, debug_prefix,
+                          create_debug=create_debug, use_flatness=use_flatness)
     if pose is None:
         return
 
     pick_base = pick_point_base(T_base_cam, pose["position"])
     # Everything needed to re-check the math offline: camera-frame grasp point,
     # the transform, and the base-frame point the robot will be commanded to.
-    np.savez(f"{debug_prefix}.npz",
-             position_cam=pose["position"], normal_cam=pose["normal"],
-             T_base_cam=T_base_cam, pick_base=pick_base)
-    print(f"Saved coordinate dump -> {debug_prefix}.npz")
+    if create_debug:
+        np.savez(f"{debug_prefix}.npz",
+                 position_cam=pose["position"], normal_cam=pose["normal"],
+                 T_base_cam=T_base_cam, pick_base=pick_base)
+        print(f"Saved coordinate dump -> {debug_prefix}.npz")
     normal_base = T_base_cam[:3, :3] @ pose["normal"]
     print(f"\nPick point (base frame):    {np.round(pick_base, 4)}")
     print(f"Normal (base frame):        {np.round(normal_base, 4)}")

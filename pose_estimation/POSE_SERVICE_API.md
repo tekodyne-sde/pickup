@@ -14,6 +14,17 @@ uvicorn pose_service:app --host 0.0.0.0 --port 8001
 
 Base URL: `http://<ml-host>:8001`. No auth — keep it on the internal network.
 
+**Optional behaviour toggles** (ML-side only; do not change the request/response
+shape except as noted):
+
+- Debug artifacts (`<prefix>_detect.png`, `.png`, `.ply`, `.npz`) are saved per
+  request by default. Disable with env var `POSE_DEBUG=0`, or `--no-debug` when
+  launched as `python pose_service.py`.
+- Grasp selection uses the flatness detector by default. Set `POSE_USE_FLATNESS=0`
+  (or `--no-flatness`) to instead pick the **bounding-box center** of the parcel;
+  in that mode `flatness_mm` reflects the whole-object plane fit (or `null` if it
+  fails), and the approach normal comes from that same plane fit.
+
 ---
 
 ## GET /health
@@ -69,7 +80,7 @@ One request at a time — concurrent calls get `409`.
 | `pick_base`    | [x,y,z]   | **grasp point in the ROBOT BASE frame, millimeters** — the value you move to. Already transformed with our hand-eye calibration. |
 | `normal_base`  | [x,y,z]   | surface normal at the grasp point, base frame, **unit vector (no unit)**, points up out of the parcel |
 | `position_cam` / `normal_cam` | [x,y,z] | same data in the camera frame (mm / unit vector), for cross-checking |
-| `flatness_mm`  | number    | mean plane residual of the chosen patch, mm (smaller = flatter)      |
+| `flatness_mm`  | number \| null | mean plane residual of the chosen patch, mm (smaller = flatter). In bounding-box-center mode (flatness detector disabled) it is the residual of the whole-object plane fit instead, or `null` if that fit fails. |
 | `inliers`      | int       | points supporting the patch plane fit                                |
 | `debug_prefix` | string    | debug artifacts saved ML-side: `<prefix>_detect.png` (raw detection box, saved BEFORE any calculation), `<prefix>.png` (red-dot grasp image), `.ply` point cloud, `.npz` coordinates — npz/ply are in METERS, internal use |
 

@@ -15,6 +15,7 @@ pulled automatically from the OAK-D at runtime (matches your existing
 camera_pipeline.py: depth aligned to CAM_A, resized to FRAME_WIDTH/HEIGHT).
 """
 
+import argparse
 import time
 import threading
 import numpy as np
@@ -208,6 +209,73 @@ class GraspPoseEstimator:
             'patch_points': best['window_points']
         }
 
+    def _deproject_pixel_robust(self, depth_map, u, v, win=5):
+        """3D point (meters) for pixel (u, v) using the MEDIAN valid depth in a
+        small window around it — a single center pixel often lands in a depth
+        hole, so median over a patch is far more reliable. None if no valid depth."""
+        h, w = depth_map.shape
+        u = int(np.clip(round(u), 0, w - 1))
+        v = int(np.clip(round(v), 0, h - 1))
+        u0, u1 = max(0, u - win), min(w, u + win + 1)
+        v0, v1 = max(0, v - win), min(h, v + win + 1)
+        patch = depth_map[v0:v1, u0:u1].astype(np.float32) / self.depth_scale
+        valid = patch[patch > 0]
+        if valid.size == 0:
+            return None
+        z = float(np.median(valid))
+        x = (u - self.cx) * z / self.fx
+        y = (v - self.cy) * z / self.fy
+        return np.array([x, y, z])
+
+    def center_bbox_patch(self, pcd, depth_map, obb_corners_2d, min_points=15):
+        """Grasp at the BOUNDING-BOX CENTER — the flatness detector bypassed.
+
+        Position is the OBB center pixel deprojected to 3D (robust median depth);
+        the approach normal comes from a single RANSAC plane fit to the whole
+        object cloud so tilt is still respected, falling back to camera -Z if the
+        fit fails. Returns the same dict shape as find_flattest_patch."""
+        points = np.asarray(pcd.points)
+        if len(points) < min_points:
+            return None
+
+        corners = np.array(obb_corners_2d)
+        cu, cv = corners[:, 0].mean(), corners[:, 1].mean()
+        position = self._deproject_pixel_robust(depth_map, cu, cv)
+        if position is None:
+            # no depth near the OBB center — use the cloud centroid instead
+            position = points.mean(axis=0)
+
+        # Normal from a plane fit to the full object cloud (approach direction);
+        # camera -Z is the fallback when the parcel is too sparse/noisy to fit.
+        normal = np.array([0.0, 0.0, -1.0])
+        flatness_score = float("nan")
+        patch_points = points
+        try:
+            plane_model, inliers = pcd.segment_plane(
+                distance_threshold=0.003, ransac_n=3, num_iterations=200
+            )
+            a, b, c, d = plane_model
+            n = np.array([a, b, c])
+            n = n / np.linalg.norm(n)
+            if n[2] > 0:
+                n = -n
+            normal = n
+            inlier_pts = points[inliers]
+            residuals = np.abs((inlier_pts @ np.array([a, b, c])) + d) / np.linalg.norm([a, b, c])
+            flatness_score = float(residuals.mean())
+            patch_points = inlier_pts
+        except RuntimeError:
+            pass
+
+        return {
+            'position': position,
+            'normal': normal,
+            'flatness_score': flatness_score,
+            'resid_p95': float("nan"),
+            'inlier_count': len(patch_points),
+            'patch_points': patch_points,
+        }
+
     def compute_yaw_axis(self, obb_corners_2d, depth_map, normal):
         corners = np.array(obb_corners_2d)
         edge_lengths = [
@@ -256,18 +324,25 @@ class GraspPoseEstimator:
         return {'position': position, 'quaternion': quat, 'rotation_matrix': rot_matrix}
 
     def estimate(self, depth_map, mask, obb_corners_2d, patch_radius=0.02, full_object_pcd=None,
-                 cls_name=None):
+                 cls_name=None, use_flatness=True):
         pcd = self.deproject_mask_to_pointcloud(depth_map, mask)
         if len(pcd.points) < 20:
             print("  [FAIL] too few valid depth points in mask")
             return None, pcd
 
         pcd = self.denoise(pcd)
-        flat_tol = CLASS_FLAT_TOL.get(cls_name, FLAT_TOL_M)
-        patch_result = self.find_flattest_patch(pcd, patch_radius=patch_radius, flat_tol=flat_tol)
-        if patch_result is None:
-            print("  [FAIL] no flat patch found meeting minimum point criteria")
-            return None, pcd
+        if use_flatness:
+            flat_tol = CLASS_FLAT_TOL.get(cls_name, FLAT_TOL_M)
+            patch_result = self.find_flattest_patch(pcd, patch_radius=patch_radius, flat_tol=flat_tol)
+            if patch_result is None:
+                print("  [FAIL] no flat patch found meeting minimum point criteria")
+                return None, pcd
+        else:
+            # Flatness detector bypassed: pick the bounding-box center instead.
+            patch_result = self.center_bbox_patch(pcd, depth_map, obb_corners_2d)
+            if patch_result is None:
+                print("  [FAIL] too few points to compute bounding-box-center grasp")
+                return None, pcd
 
         x_axis = self.compute_yaw_axis(obb_corners_2d, depth_map, patch_result['normal'])
         if x_axis is None:
@@ -446,6 +521,17 @@ def terminal_listener():
 # Main loop
 # ============================================================
 def main():
+    parser = argparse.ArgumentParser(description="Live parcel pick pipeline test (OAK-D, no robot).")
+    parser.add_argument("--no-debug", action="store_true",
+                        help="do not save annotated snapshots or open the Open3D view")
+    parser.add_argument("--no-flatness", action="store_true",
+                        help="skip the flatness detector; pick the bounding-box center instead")
+    args = parser.parse_args()
+    create_debug = not args.no_debug
+    use_flatness = not args.no_flatness
+    print(f"debug artifacts: {'on' if create_debug else 'off'} | "
+          f"grasp mode: {'flatness detector' if use_flatness else 'bounding-box center'}")
+
     print(f"Loading model: {MODEL_PATH}")
     model = YOLO(MODEL_PATH)
 
@@ -526,7 +612,7 @@ def main():
 
                 pose, full_pcd = estimator.estimate(
                     depth_frame, mask, last_corners, patch_radius=SUCTION_PATCH_RADIUS,
-                    cls_name=last_class_name
+                    cls_name=last_class_name, use_flatness=use_flatness
                 )
 
                 if pose is None:
@@ -539,11 +625,11 @@ def main():
                     print(f"  Flatness score: {pose['flatness_score']:.5f}")
                     print(f"  Inlier points: {pose['inlier_count']}")
 
-                out_path = f"snapshot_{snapshot_idx}_result.jpg"
-                save_annotated_snapshot(rgb_frame, last_corners, last_class_name,
-                                         pose, fx, fy, cx, cy, out_path, mask=mask)
-
-                show_open3d_view(full_pcd, pose)
+                if create_debug:
+                    out_path = f"snapshot_{snapshot_idx}_result.jpg"
+                    save_annotated_snapshot(rgb_frame, last_corners, last_class_name,
+                                             pose, fx, fy, cx, cy, out_path, mask=mask)
+                    show_open3d_view(full_pcd, pose)
                 print("\nReady — type 'capture' again or 'quit' to exit.\n")
                 snapshot_idx += 1
 
