@@ -85,6 +85,12 @@ back up; append a session entry when you finish a chunk.
 
 ## Open follow-ups (not done)
 
+### NEXT (active) — Effort 2: fix out-of-range Z / bad-depth grasps
+Planned & approved, not started. Implement Parts A–E from the plan file
+`C:\Users\panug\.claude\plans\i-think-we-can-stateless-dragon.md` (StereoDepth filters +
+`is_plausible_grasp` guardrails + retry-then-no-pick). TDD: write `tests/test_pose_validity.py`
+red first. See decisions D7/D8. This is the first thing to pick up in the new session.
+
 ### DEFERRED — config extraction + project cleanup (its own dedicated effort)
 Planned for a later session; requested 2026-07-12. Do this as a standalone, carefully-scoped
 refactor — **must not change `pose_service.py`'s behavior, the `/pose` HTTP contract, or the
@@ -127,3 +133,39 @@ refactor — **must not change `pose_service.py`'s behavior, the `/pose` HTTP co
 - Guaranteed `class_name` present in every `/pose` body, null iff `detected` false; clamped
   unknown class indices. Documented in `POSE_SERVICE_API.md` and `POSE_CLASS_NAME_SPEC.md`.
 - HW-in-the-loop steps (focus tuning + real belt-stop capture) remain for a human on the cell.
+
+### 2026-07-12 (cont.) — live verification + depth-Z bug diagnosed & planned
+- **Effort 1 verified live** on the connected OAK-D: service boots, `camera_live:true`; empty-scene
+  `POST /pose` → `{"detected":false,"class_name":null,...}` in ~5.8 s (0.5 s settle + 5 s retry);
+  `409` when busy; `/reset` cancels a waiting request. 17/17 unit tests green. User tuned and
+  pasted `RGB_LENS_POSITION=104`, `RGB_EXPOSURE_US=8000`, `RGB_ISO=400` via `tune_camera.py`.
+  (PowerShell note: use `curl.exe` / `Invoke-RestMethod`, not the `curl` alias.)
+- **New bug found:** `/pose` sometimes returns Z far outside the robot's reach (camera-frame
+  Z≈2.2 m, base Z≈−1.5 m, `normal_cam z≈−0.03`) even with correct 2D detection. Diagnosed from
+  the `.npz`/`.ply` debug dumps:
+  - Root cause = stereo **flying pixels** on textureless/glossy white-bag + edge regions (depth
+    points out to 46–60 m in the clouds). `deproject_mask_to_pointcloud` keeps any `depth>0`
+    ([pose.py:108]); denoise misses coherent bad blobs; `find_flattest_patch` RANSAC locks onto a
+    spurious ~vertical plane; nothing rejects the implausible pose. **Median depth is always
+    correct (~0.45 m)** — only outliers break it.
+  - The 2D marker looks correct because deproject→reproject cancels Z (pixel round-trips
+    regardless of depth) — the `.npz`/`.ply` are the only truthful view of Z. See D7/D8 below.
+- **Effort 2 planned, NOT started.** Full plan in
+  `C:\Users\panug\.claude\plans\i-think-we-can-stateless-dragon.md`. Approved scope: BOTH
+  StereoDepth quality filters AND 3D validity guardrails; failed sanity check → retry fresh
+  frames then clean `detected:false`. Next action on resume: implement Parts A–E (TDD — write
+  `tests/test_pose_validity.py` red first).
+
+## Decisions (Effort 2 — planned, why)
+
+- **D7 — improve StereoDepth quality at the source.** Textureless surfaces produce flying pixels;
+  fix with `stereo.initialConfig.setConfidenceThreshold(STEREO_CONFIDENCE)` +
+  `postProcessing.thresholdFilter.minRange/maxRange` (mm, clamps depth range — kills 46–60 m
+  flyers) + median/speckle/spatial/temporal filters. New tunable constants `STEREO_CONFIDENCE`,
+  `DEPTH_MIN_MM`, `DEPTH_MAX_MM` (robot_pick.py) — belong with the focus/exposure tuning workflow.
+- **D8 — 3D validity guardrails + retry.** deproject clamps to a depth band; patch Z uses the
+  **median** of inliers (robust); `is_plausible_grasp(position, normal)` rejects out-of-band Z or
+  non-vertical normal (`|normal_z| < GRASP_NORMAL_Z_MIN`) → `estimate()` returns None. `/pose`
+  retries on fresh frames when detection OR grasp fails, up to `NO_DETECT_RETRY_S`, then clean
+  `detected:false` no-pick (never an out-of-reach point). New constants `GRASP_Z_MIN_M`,
+  `GRASP_Z_MAX_M`, `GRASP_NORMAL_Z_MIN` (pose.py). All hardware-tunable.
